@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-title" content="PAPS TAPS">
 <meta name="format-detection" content="telephone=no">
 <meta name="theme-color" content="#0d0518">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <title>PAPS TAPS</title>
 <style>
 * {
@@ -1143,6 +1144,7 @@ img.rarity-legendary.silhouette { filter: brightness(0) drop-shadow(0 0 10px rgb
     <div class="profile-row"><span class="profile-label">PAP коины</span><span class="profile-value" id="profile-pap">0</span></div>
     <div class="profile-row"><span class="profile-label">⭐ Звёздочки</span><span class="profile-value" id="profile-stars">0</span></div>
     <div class="profile-row"><span class="profile-label">Всего персонажей</span><span class="profile-value" id="profile-total">0</span></div>
+    <div class="profile-row"><span class="profile-label">☁️ Облако</span><span class="profile-value" id="profile-cloud">—</span></div>
     <div class="profile-rarity-list" id="profile-rarity-list"></div>
     <button class="profile-close" onclick="closeProfile()">Закрыть</button>
   </div>
@@ -1594,6 +1596,8 @@ function saveGame() {
       characters: state.characters
     };
     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    cloudRev++;        // прогресс изменился
+    cloudPushTick();   // при возможности сразу отправляем в облако
   } catch(e) {}
 }
 
@@ -1624,6 +1628,8 @@ function normalizeChar(c, fallbackLevels) {
 }
 
 function loadGame() {
+  // состояние игры синхронизировано с localStorage — облако можно обновлять
+  _stateLoaded = true;
   try {
     migrateOldSaves();
     const saved = localStorage.getItem(SAVE_KEY);
@@ -1724,12 +1730,225 @@ function resetProgress() {
   _lastLeagueIdx = -1;
   _lastCharSrc = '';
   showToast('Прогресс сброшен');
+  // сбрасываем и облако, чтобы при следующем входе не вернулся старый прогресс
+  cloudRev++;
+  if (!cloudPush(true, true)) {
+    // не вышло (офлайн и т.п.) — запомним сброс и почистим облако при первой возможности
+    try { localStorage.setItem(WIPE_KEY, nowIso()); } catch(e) {}
+  }
 }
 function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
   clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove('show'), 1800);
 }
+
+// ===== Cloud sync (Supabase) =====
+// Прогресс хранится и на устройстве (localStorage), и в облаке (Supabase).
+// Игрок идентифицируется ником с экрана регистрации (без @, в нижнем регистре):
+// заходишь с любого устройства под тем же ником — прогресс подтягивается из облака.
+// Данные устройства и облака ОБЪЕДИНЯЮТСЯ: персонажи мержатся по charId,
+// ступень/уровни/клики берутся максимальными, PAP-коины и звёздочки — тоже большее.
+// Нет интернета — игра работает как раньше на localStorage и догоняет облако при появлении сети.
+const SUPABASE_URL = 'https://hzqulwudugbcaihrqdav.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_meQpl_cnUmzZ3FvupI445w_7cfd5eUZ';
+const SYNC_KEY = 'paps_taps_last_sync'; // время последней успешной синхронизации
+const WIPE_KEY = 'paps_taps_wipe_at';   // время сброса прогресса (чтобы облако не вернуло старое)
+let cloudOk = true;        // false — облако недоступно (не спамим запросами)
+let lastCloudFail = 0;
+let cloudSynced = false;   // была ли успешная синхронизация в этом заходе
+let cloudBusy = false;     // запрос в полёте
+let cloudRev = 0;          // счётчик изменений прогресса
+let cloudPushedRev = -1;   // счётчик, успешно выгруженный в облако последним
+let _stateLoaded = false;  // загружен ли сейв в состояние игры
+
+function nickKey() {
+  return (localStorage.getItem('paps_taps_nick') || '').replace(/^@+/, '').trim().toLowerCase();
+}
+function nowIso() { return new Date().toISOString(); }
+
+function sbFetch(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({
+    'apikey': SUPABASE_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_KEY,
+    'Content-Type': 'application/json'
+  }, opts.headers || {});
+  return fetch(SUPABASE_URL + path, opts);
+}
+
+// Полный сейв в том же формате, что и в localStorage
+function stateToSave() {
+  return {
+    version: SAVE_FORMAT_VERSION,
+    coins: state.coins,
+    stars: state.stars,
+    activeChar: state.activeChar,
+    characters: state.characters
+  };
+}
+
+// Объединяем копию персонажа с устройства и из облака (берём максимум)
+function mergeChar(a, b) {
+  return {
+    charId: a.charId,
+    stage: Math.max(a.stage || 0, b.stage || 0),
+    clicks: Math.max(a.clicks || 0, b.clicks || 0),
+    levels: {
+      click: Math.max((a.levels && a.levels.click) || 0, (b.levels && b.levels.click) || 0),
+      auto:  Math.max((a.levels && a.levels.auto)  || 0, (b.levels && b.levels.auto)  || 0),
+      coin:  Math.max((a.levels && a.levels.coin)  || 0, (b.levels && b.levels.coin)  || 0),
+      crit:  Math.max((a.levels && a.levels.crit)  || 0, (b.levels && b.levels.crit)  || 0)
+    }
+  };
+}
+
+// Объединение облачного сейва с локальным: персонажи по charId, максимумы по прокачке
+function cloudMergeData(remote) {
+  if (!remote || typeof remote !== 'object' || !Array.isArray(remote.characters) || remote.characters.length === 0) return null;
+  const byId = {};
+  (state.characters || []).forEach(function(c) { if (c && typeof c.charId === 'number' && CHARACTERS[c.charId]) byId[c.charId] = c; });
+  remote.characters.forEach(function(c) {
+    if (!c || typeof c.charId !== 'number' || !CHARACTERS[c.charId]) return; // битые записи игнорируем
+    const fixed = {
+      charId: c.charId,
+      stage: Math.min(c.stage || 0, CHARACTERS[c.charId].stages.length - 1),
+      clicks: c.clicks || 0,
+      levels: c.levels || { click: 0, auto: 0, coin: 0, crit: 0 }
+    };
+    byId[c.charId] = byId[c.charId] ? mergeChar(byId[c.charId], fixed) : fixed;
+  });
+  const chars = Object.keys(byId).map(function(k) { return byId[k]; });
+  const merged = {
+    version: SAVE_FORMAT_VERSION,
+    coins: Math.max(state.coins || 0, remote.coins || 0),
+    stars: Math.max(state.stars || 0, remote.stars || 0),
+    activeChar: 0,
+    characters: chars
+  };
+  // активным оставляем текущего персонажа, если он есть в объединённом списке
+  const act = state.characters && state.characters[state.activeChar];
+  if (act) {
+    const idx = chars.findIndex(function(c) { return c.charId === act.charId; });
+    if (idx >= 0) merged.activeChar = idx;
+  }
+  return merged;
+}
+
+// Применяем сейв: пишем в localStorage и перезагружаем состояние
+function applyCloudData(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.characters) || data.characters.length === 0) return;
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); } catch(e) {}
+  // сбрасываем кэши интерфейса, чтобы всё перерисовалось с новыми данными
+  farmChars = []; farmCookies = []; farmInitialized = false;
+  _lastLeagueIdx = -1; _lastCharSrc = '';
+  loadGame();
+  if (!document.getElementById('game').classList.contains('hidden')) {
+    updateUI(); refreshShop();
+    if (document.getElementById('panels-track').getAttribute('data-panel') === 'farm') initFarm();
+  }
+}
+
+// Выгрузить прогресс в облако (upsert по нику). true — запрос отправлен
+function cloudPush(silent, force) {
+  if (cloudBusy || !navigator.onLine) return false;
+  if (!_stateLoaded && !force) return false; // состояние ещё не загружено — нечего выгружать
+  const nick = nickKey();
+  if (!nick) return false;
+  const rev = cloudRev;
+  cloudBusy = true;
+  sbFetch('/rest/v1/players', {
+    method: 'POST',
+    headers: { 'Prefer': 'resolution=merge-duplicates' },
+    body: JSON.stringify({
+      nick: nick,
+      coins: state.coins,
+      stars: state.stars || 0,
+      data: stateToSave(),
+      updated_at: nowIso()
+    })
+  }).then(function(r) {
+    cloudBusy = false;
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    cloudOk = true; cloudSynced = true; cloudPushedRev = rev;
+    try { localStorage.setItem(SYNC_KEY, nowIso()); localStorage.removeItem(WIPE_KEY); } catch(e) {}
+    updateCloudBadge();
+    if (!silent) showToast('☁️ Прогресс сохранён в облако');
+  }).catch(function() {
+    cloudBusy = false; cloudOk = false; lastCloudFail = Date.now();
+    updateCloudBadge();
+  });
+  return true;
+}
+
+// Стартовая синхронизация при входе: мержим облако с локальным сейвом
+function cloudSyncStart() {
+  if (cloudBusy) return;
+  const nick = nickKey();
+  if (!nick) return;
+  // подгружаем локальный сейв в состояние, чтобы мержить реальные данные
+  if (!_stateLoaded && hasSave()) loadGame();
+  cloudBusy = true;
+  sbFetch('/rest/v1/players?select=nick,data,updated_at&nick=eq.' + encodeURIComponent(nick) + '&limit=1')
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(rows) {
+      cloudBusy = false; cloudOk = true;
+      const row = rows && rows[0];
+      const wipedAt = localStorage.getItem(WIPE_KEY) || '';
+      if (row && row.data && (!wipedAt || (row.updated_at || '') > wipedAt)) {
+        const before = { n: state.characters.length, c: state.coins || 0, s: state.stars || 0 };
+        const merged = cloudMergeData(row.data);
+        if (merged) {
+          applyCloudData(merged);
+          const changed = merged.characters.length !== before.n || (merged.coins || 0) !== before.c || (merged.stars || 0) !== before.s;
+          if (changed) showToast('☁️ Прогресс загружен из облака');
+        }
+      }
+      cloudSynced = true;
+      // выгружаем объединённое состояние, чтобы облако было не хуже локального
+      cloudPush(true);
+      updateCloudBadge();
+    })
+    .catch(function() {
+      cloudBusy = false; cloudOk = false; lastCloudFail = Date.now();
+      updateCloudBadge();
+    });
+}
+
+// Тик синхронизации (после автосейва): пушим, только если есть несинхронизированные изменения
+function cloudPushTick() {
+  if (!navigator.onLine) { updateCloudBadge(); return; }
+  if (!cloudOk && Date.now() - lastCloudFail < 30000) return; // после сбоя ждём 30 сек
+  if (!cloudSynced || cloudRev > cloudPushedRev) cloudPush(true);
+}
+
+// Статус облака в профиле
+function updateCloudBadge() {
+  const el = document.getElementById('profile-cloud');
+  if (!el) return;
+  if (!navigator.onLine) el.textContent = 'офлайн · прогресс на устройстве';
+  else if (!cloudOk) el.textContent = 'нет связи · повторим позже';
+  else {
+    const t = localStorage.getItem(SYNC_KEY);
+    el.textContent = t ? ('синхронизировано в ' + new Date(t).toLocaleTimeString('ru')) : 'включено';
+  }
+}
+
+// Интернет появился — сразу догоняем облако
+window.addEventListener('online', function() { cloudOk = true; cloudPushTick(); });
+window.addEventListener('offline', function() { updateCloudBadge(); });
+
+// ===== Telegram Mini App =====
+(function tgInit() {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (!tg) return;
+  try { tg.ready(); tg.expand(); } catch(e) {}
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch(e) {}
+  try {
+    if (tg.setHeaderColor) tg.setHeaderColor('#0d0518');
+    if (tg.setBackgroundColor) tg.setBackgroundColor('#0d0518');
+  } catch(e) {}
+})();
 
 // ===== Helpers =====
 function clickPower() { return 1 + activeInst().levels.click; }
@@ -1743,7 +1962,16 @@ function activeData() { return CHARACTERS[activeInst().charId]; }
 function activeStages() { return activeData().stages; }
 function isEggStage() { return activeInst().stage === 0; }
 function isMaxStage() { const inst = activeInst(); return inst.stage >= CHARACTERS[inst.charId].stages.length - 1; }
-function vibrate(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch(e) {} }
+function vibrate(ms) {
+  try {
+    if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.HapticFeedback) {
+      // в Telegram используем нативную отдачу
+      window.Telegram.WebApp.HapticFeedback.impactOccurred(ms >= 40 ? 'heavy' : 'light');
+      return;
+    }
+    if (navigator.vibrate) navigator.vibrate(ms);
+  } catch(e) {}
+}
 function currentLeagueIdx() {
   let idx = 0;
   for (let i = 0; i < LEAGUES.length; i++) { if (state.coins >= LEAGUES[i].min) idx = i; }
@@ -2083,6 +2311,7 @@ function showProfile() {
     row.appendChild(badge); row.appendChild(count);
     list.appendChild(row);
   });
+  updateCloudBadge();
   document.getElementById('profile-popup').classList.remove('hidden');
 }
 function closeProfile() { document.getElementById('profile-popup').classList.add('hidden'); }
@@ -2093,6 +2322,9 @@ function checkRegistration() {
   if (!nick) {
     document.getElementById('reg-screen').classList.remove('hidden');
     document.getElementById('menu').style.display = 'none';
+    // в Telegram подставляем @username игрока, чтобы не набирать вручную
+    const tgUser = window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initDataUnsafe && window.Telegram.WebApp.initDataUnsafe.user;
+    if (tgUser && tgUser.username) document.getElementById('reg-input').value = tgUser.username;
     document.getElementById('reg-input').focus();
     return false;
   }
@@ -2111,6 +2343,8 @@ function submitRegistration() {
     document.getElementById('btn-reset').classList.remove('hidden');
   }
   showToast('Добро пожаловать, ' + nick + '!');
+  // синхронизация: подтягиваем прогресс этого ника из облака (если играли с другого устройства)
+  cloudSyncStart();
 }
 
 // Allow submitting registration by pressing Enter inside the nick input
@@ -2515,6 +2749,8 @@ function updateLeague() {
 (function menuInit() {
   // Check registration first — show reg screen if no nickname
   if (!checkRegistration()) return;
+  // фоновая синхронизация с облаком при каждом входе в игру
+  cloudSyncStart();
   if (hasSave()) {
     document.getElementById('btn-start').textContent = 'ПРОДОЛЖИТЬ';
     document.getElementById('menu-hint').textContent = 'Прогресс сохранён!';
